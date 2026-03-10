@@ -1,5 +1,10 @@
 # 📋 QScopy
 ** Glassmorphism-style Clipboard Manager for Wayland (Hyprland).**
+<img width="870" height="700" alt="resim" src="https://github.com/user-attachments/assets/f4f80dc0-6c34-47f1-8164-0719d96d3e2c" />
+
+
+https://github.com/user-attachments/assets/d4e6e337-7879-4653-bc84-cf54db7ff53c
+
 
 ---
 ✨ **Built with Vibe Coding**
