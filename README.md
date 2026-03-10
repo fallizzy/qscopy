@@ -1,0 +1,2 @@
+# qscopy
+Quickshell Clipboard Manager
