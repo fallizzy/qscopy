@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# QScopy Launcher Script
+# Bu script klasörün içindeki shell.qml dosyasını otomatik bulur.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QML_PATH="$(dirname "$SCRIPT_DIR")/qml/shell.qml"
+
+# Eğer kurulu olduğu yer farklıysa burayı güncelleyebilirsiniz:
+# QML_PATH="$HOME/.config/qscopy/qml/shell.qml"
+
+if [ ! -f "$QML_PATH" ]; then
+    echo "Error: shell.qml not found at $QML_PATH"
+    exit 1
+fi
+
+# Check if already running
+PID=$(pgrep -f "quickshell -p $QML_PATH")
+
+if [ -n "$PID" ]; then
+    # Toggle off
+    kill $PID
+    sleep 0.1
+    kill -9 $PID 2>/dev/null
+else
+    # Toggle on
+    quickshell -p "$QML_PATH" > /dev/null 2>&1 &
+fi

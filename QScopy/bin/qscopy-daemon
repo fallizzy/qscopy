@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+import os
+import sys
+import sqlite3
+import argparse
+import subprocess
+import time
+import hashlib
+import json
+
+CACHE_DIR = os.path.join(os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "qscopy")
+DATA_DIR = os.path.join(os.getenv("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "qscopy")
+IMAGE_DIR = os.path.join(CACHE_DIR, "images")
+DB_PATH = os.path.join(DATA_DIR, "history.db")
+LOG_FILE = os.path.join(CACHE_DIR, "daemon.log")
+
+def log(msg):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{time.ctime()}] {msg}\n")
+
+def init_db():
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS history
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  content TEXT, 
+                  type TEXT, 
+                  timestamp INTEGER, 
+                  pinned INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+    conn.commit()
+    conn.close()
+
+def get_setting(key, default):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def watch():
+    init_db()
+    log(f"Exec: wl-paste --watch {__file__} store")
+    os.execvp("wl-paste", ["wl-paste", "--watch", __file__, "store"])
+
+def store():
+    try:
+        sys.stdin.buffer.read()
+    except: pass
+
+    try:
+        types_out = subprocess.check_output(['wl-paste', '--list-types'], stderr=subprocess.DEVNULL).decode().splitlines()
+    except: return
+
+    image_types = [t for t in types_out if t.startswith('image/')]
+    text_types = [t for t in types_out if t.startswith('text/') or t in ('UTF8_STRING', 'STRING')]
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    captured = False
+
+    if image_types:
+        best_type = 'image/png' if 'image/png' in image_types else image_types[0]
+        try:
+            result = subprocess.run(['wl-paste', '--type', best_type], capture_output=True, timeout=3)
+            if result.returncode == 0 and result.stdout:
+                data = result.stdout
+                h = hashlib.sha256(data).hexdigest()
+                filepath = os.path.join(IMAGE_DIR, f"{h}.png")
+                c.execute("SELECT id FROM history WHERE content=?", (filepath,))
+                existing = c.fetchone()
+                if existing:
+                    c.execute("UPDATE history SET timestamp=? WHERE id=?", (int(time.time()), existing[0]))
+                else:
+                    with open(filepath, 'wb') as f: f.write(data)
+                    c.execute("INSERT INTO history(content, type, timestamp, pinned) VALUES (?, ?, ?, 0)", (filepath, 'image', int(time.time())))
+                conn.commit()
+                captured = True
+        except: pass
+
+    if not captured and text_types:
+        try:
+            result = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, timeout=3)
+            if result.returncode == 0:
+                data = result.stdout.decode('utf-8', errors='replace')
+                if data.strip():
+                    c.execute("SELECT id FROM history WHERE content=? AND type='text'", (data,))
+                    existing = c.fetchone()
+                    if existing:
+                        c.execute("UPDATE history SET timestamp=? WHERE id=?", (int(time.time()), existing[0]))
+                    else:
+                        c.execute("INSERT INTO history(content, type, timestamp, pinned) VALUES (?, ?, ?, 0)", (data, 'text', int(time.time())))
+                    conn.commit()
+        except: pass
+    conn.close()
+
+def db_list(search="", type_filter=""):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    query = "SELECT * FROM history WHERE 1=1"
+    params = []
+    if type_filter and type_filter != "all":
+        query += " AND type=?"; params.append(type_filter)
+    if search:
+        query += " AND type='text' AND content LIKE ?"; params.append(f"%{search}%")
+    query += " ORDER BY pinned DESC, timestamp DESC"
+    c.execute(query, params)
+    rows = c.fetchall()
+    print(json.dumps([dict(r) for r in rows]))
+    conn.close()
+
+def delete(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT type, content FROM history WHERE id=?", (item_id,))
+    row = c.fetchone()
+    if row:
+        if row[0] == 'image':
+            try: os.remove(row[1])
+            except: pass
+        c.execute("DELETE FROM history WHERE id=?", (item_id,))
+        conn.commit()
+    conn.close()
+
+def clear():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT content FROM history WHERE type='image' AND pinned=0")
+    for row in c.fetchall():
+        try: os.remove(row[0])
+        except: pass
+    c.execute("DELETE FROM history WHERE pinned=0")
+    conn.commit()
+    conn.close()
+
+def set_pin(item_id, pinned):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE history SET pinned=? WHERE id=?", (1 if pinned else 0, item_id))
+    conn.commit()
+    conn.close()
+
+def get_clip(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT content, type FROM history WHERE id=?", (item_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row: return
+    content, ctype = row
+    if ctype == 'text':
+        subprocess.run(['wl-copy', '--type', 'text/plain'], input=content.encode('utf-8'))
+    elif ctype == 'image':
+        with open(content, 'rb') as f: data = f.read()
+        subprocess.run(['wl-copy', '--type', 'image/png'], input=data)
+
+def main():
+    parser = argparse.ArgumentParser(description="QScopy Daemon")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("watch")
+    subparsers.add_parser("store")
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("--search", default="")
+    list_parser.add_argument("--type-filter", default="all")
+    del_parser = subparsers.add_parser("delete"); del_parser.add_argument("id", type=int)
+    subparsers.add_parser("clear")
+    pin_parser = subparsers.add_parser("pin"); pin_parser.add_argument("id", type=int)
+    unpin_parser = subparsers.add_parser("unpin"); unpin_parser.add_argument("id", type=int)
+    get_parser = subparsers.add_parser("get"); get_parser.add_argument("id", type=int)
+    cfg_parser = subparsers.add_parser("config")
+    cfg_sub = cfg_parser.add_subparsers(dest="cfg_cmd")
+    c_set = cfg_sub.add_parser("set"); c_set.add_argument("key"); c_set.add_argument("value")
+    c_get = cfg_sub.add_parser("get"); c_get.add_argument("key")
+    
+    args = parser.parse_args()
+    init_db()
+    if args.command == "watch":
+        if get_setting("auto_delete", "false") == "true": clear()
+        watch()
+    elif args.command == "store": store()
+    elif args.command == "list": db_list(args.search, args.type_filter)
+    elif args.command == "delete": delete(args.id)
+    elif args.command == "clear": clear()
+    elif args.command == "pin": set_pin(args.id, True)
+    elif args.command == "unpin": set_pin(args.id, False)
+    elif args.command == "get": get_clip(args.id)
+    elif args.command == "config":
+        if args.cfg_cmd == "set": set_setting(args.key, args.value)
+        elif args.cfg_cmd == "get": print(get_setting(args.key, ""))
+            
+if __name__ == "__main__":
+    main()
